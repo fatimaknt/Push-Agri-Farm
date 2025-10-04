@@ -1,0 +1,34 @@
+{
+    "name": "pushagri-farm",
+    "version": "1.0.0",
+    "description": "Site web moderne pour Push'Agri Farm avec animations",
+    "main": "server.js",
+    "scripts": {
+        "dev": "concurrently \"npm run server\" \"npm run client\"",
+        "server": "nodemon server.js",
+        "client": "cd client && npm start",
+        "build": "cd client && npm run build",
+        "start": "node server.js",
+        "install-client": "cd client && npm install",
+        "install-server": "npm install"
+    },
+    "dependencies": {
+        "express": "^4.18.2",
+        "cors": "^2.8.5",
+        "dotenv": "^16.3.1",
+        "nodemailer": "^6.9.7",
+        "multer": "^1.4.5-lts.1"
+    },
+    "devDependencies": {
+        "nodemon": "^3.0.1",
+        "concurrently": "^8.2.2"
+    },
+    "keywords": [
+        "agriculture",
+        "pisciculture",
+        "react",
+        "nodejs"
+    ],
+    "author": "Push'Agri Farm",
+    "license": "MIT"
+}
