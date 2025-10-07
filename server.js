@@ -2,29 +2,35 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const nodemailer = require('nodemailer');
-const sqlite3 = require('sqlite3').verbose();
+const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 require('dotenv').config();
 
 const app = express();
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 3000;
 
-// Base de données SQLite
-const db = new sqlite3.Database('./users.db');
+// Base de données PostgreSQL
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL || 'postgresql://localhost:5432/pushagri',
+    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+});
 
 // Créer la table des utilisateurs
-db.serialize(() => {
-    db.run(`CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        email TEXT UNIQUE,
-        password TEXT,
-        firstName TEXT,
-        lastName TEXT,
-        phone TEXT,
+pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        email VARCHAR(255) UNIQUE,
+        password VARCHAR(255),
+        "firstName" VARCHAR(255),
+        "lastName" VARCHAR(255),
+        phone VARCHAR(255),
         address TEXT,
-        createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`);
+        "createdAt" TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+`, (err) => {
+    if (err) console.error('Erreur création table:', err);
+    else console.log('Table utilisateurs créée/connectée');
 });
 
 // Middleware
@@ -33,7 +39,7 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, 'client/build')));
 
 // Configuration email
-const transporter = nodemailer.createTransport({
+const transporter = nodemailer.createTransporter({
     service: 'gmail',
     auth: {
         user: process.env.EMAIL_USER || 'pushagrifarm@gmail.com',
@@ -45,46 +51,40 @@ const transporter = nodemailer.createTransport({
 app.post('/api/register', async (req, res) => {
     try {
         const { email, password, firstName, lastName, phone, address } = req.body;
-
+        
         // Vérifier si l'utilisateur existe déjà
-        db.get('SELECT * FROM users WHERE email = ?', [email], async (err, user) => {
-            if (err) {
-                return res.status(500).json({ success: false, message: 'Erreur serveur' });
-            }
-
-            if (user) {
-                return res.status(400).json({ success: false, message: 'Cet email est déjà utilisé' });
-            }
-
-            // Hasher le mot de passe
-            const hashedPassword = await bcrypt.hash(password, 10);
-
-            // Insérer le nouvel utilisateur
-            db.run(
-                'INSERT INTO users (email, password, firstName, lastName, phone, address) VALUES (?, ?, ?, ?, ?, ?)',
-                [email, hashedPassword, firstName, lastName, phone, address],
-                function (err) {
-                    if (err) {
-                        return res.status(500).json({ success: false, message: 'Erreur lors de la création du compte' });
-                    }
-
-                    // Générer un token JWT
-                    const token = jwt.sign(
-                        { userId: this.lastID, email },
-                        process.env.JWT_SECRET || 'your-secret-key',
-                        { expiresIn: '7d' }
-                    );
-
-                    res.json({
-                        success: true,
-                        message: 'Compte créé avec succès',
-                        token,
-                        user: { id: this.lastID, email, firstName, lastName }
-                    });
-                }
-            );
+        const existingUser = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+        
+        if (existingUser.rows.length > 0) {
+            return res.status(400).json({ success: false, message: 'Cet email est déjà utilisé' });
+        }
+        
+        // Hasher le mot de passe
+        const hashedPassword = await bcrypt.hash(password, 10);
+        
+        // Insérer le nouvel utilisateur
+        const result = await pool.query(
+            'INSERT INTO users (email, password, "firstName", "lastName", phone, address) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
+            [email, hashedPassword, firstName, lastName, phone, address]
+        );
+        
+        const userId = result.rows[0].id;
+        
+        // Générer un token JWT
+        const token = jwt.sign(
+            { userId, email },
+            process.env.JWT_SECRET || 'your-secret-key',
+            { expiresIn: '7d' }
+        );
+        
+        res.json({
+            success: true,
+            message: 'Compte créé avec succès',
+            token,
+            user: { id: userId, email, firstName, lastName }
         });
     } catch (error) {
+        console.error('Erreur inscription:', error);
         res.status(500).json({ success: false, message: 'Erreur serveur' });
     }
 });
@@ -92,42 +92,41 @@ app.post('/api/register', async (req, res) => {
 app.post('/api/login', async (req, res) => {
     try {
         const { email, password } = req.body;
-
-        db.get('SELECT * FROM users WHERE email = ?', [email], async (err, user) => {
-            if (err) {
-                return res.status(500).json({ success: false, message: 'Erreur serveur' });
+        
+        const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+        
+        if (result.rows.length === 0) {
+            return res.status(400).json({ success: false, message: 'Email ou mot de passe incorrect' });
+        }
+        
+        const user = result.rows[0];
+        
+        // Vérifier le mot de passe
+        const isValidPassword = await bcrypt.compare(password, user.password);
+        if (!isValidPassword) {
+            return res.status(400).json({ success: false, message: 'Email ou mot de passe incorrect' });
+        }
+        
+        // Générer un token JWT
+        const token = jwt.sign(
+            { userId: user.id, email: user.email },
+            process.env.JWT_SECRET || 'your-secret-key',
+            { expiresIn: '7d' }
+        );
+        
+        res.json({
+            success: true,
+            message: 'Connexion réussie',
+            token,
+            user: { 
+                id: user.id, 
+                email: user.email, 
+                firstName: user.firstName, 
+                lastName: user.lastName 
             }
-
-            if (!user) {
-                return res.status(400).json({ success: false, message: 'Email ou mot de passe incorrect' });
-            }
-
-            // Vérifier le mot de passe
-            const isValidPassword = await bcrypt.compare(password, user.password);
-            if (!isValidPassword) {
-                return res.status(400).json({ success: false, message: 'Email ou mot de passe incorrect' });
-            }
-
-            // Générer un token JWT
-            const token = jwt.sign(
-                { userId: user.id, email: user.email },
-                process.env.JWT_SECRET || 'your-secret-key',
-                { expiresIn: '7d' }
-            );
-
-            res.json({
-                success: true,
-                message: 'Connexion réussie',
-                token,
-                user: {
-                    id: user.id,
-                    email: user.email,
-                    firstName: user.firstName,
-                    lastName: user.lastName
-                }
-            });
         });
     } catch (error) {
+        console.error('Erreur connexion:', error);
         res.status(500).json({ success: false, message: 'Erreur serveur' });
     }
 });
@@ -136,22 +135,18 @@ app.post('/api/login', async (req, res) => {
 app.put('/api/profile', async (req, res) => {
     try {
         const { userId, firstName, lastName, phone, address, city } = req.body;
-
-        db.run(
-            'UPDATE users SET firstName = ?, lastName = ?, phone = ?, address = ? WHERE id = ?',
-            [firstName, lastName, phone, address, userId],
-            function (err) {
-                if (err) {
-                    return res.status(500).json({ success: false, message: 'Erreur lors de la mise à jour du profil' });
-                }
-
-                res.json({
-                    success: true,
-                    message: 'Profil mis à jour avec succès'
-                });
-            }
+        
+        await pool.query(
+            'UPDATE users SET "firstName" = $1, "lastName" = $2, phone = $3, address = $4 WHERE id = $5',
+            [firstName, lastName, phone, address, userId]
         );
+        
+        res.json({
+            success: true,
+            message: 'Profil mis à jour avec succès'
+        });
     } catch (error) {
+        console.error('Erreur mise à jour profil:', error);
         res.status(500).json({ success: false, message: 'Erreur serveur' });
     }
 });
