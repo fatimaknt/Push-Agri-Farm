@@ -2,35 +2,91 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const nodemailer = require('nodemailer');
-const { Pool } = require('pg');
+const sqlite3 = require('sqlite3').verbose();
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const { createServer } = require('http');
 require('dotenv').config();
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 5000;
 
-// Base de données PostgreSQL
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL || 'postgresql://localhost:5432/pushagri',
-    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
-});
+// Fonction pour trouver un port disponible
+function findAvailablePort(startPort, maxAttempts = 10) {
+    return new Promise((resolve, reject) => {
+        let currentPort = startPort;
+        let attempts = 0;
+
+        const tryPort = () => {
+            if (attempts >= maxAttempts) {
+                reject(new Error(`Aucun port disponible trouvé après ${maxAttempts} tentatives`));
+                return;
+            }
+
+            const server = createServer();
+
+            server.listen(currentPort, (err) => {
+                if (err) {
+                    attempts++;
+                    currentPort++;
+                    tryPort();
+                } else {
+                    server.close(() => {
+                        resolve(currentPort);
+                    });
+                }
+            });
+
+            server.on('error', (err) => {
+                if (err.code === 'EADDRINUSE') {
+                    attempts++;
+                    currentPort++;
+                    tryPort();
+                } else {
+                    reject(err);
+                }
+            });
+        };
+
+        tryPort();
+    });
+}
+
+// Base de données SQLite
+const db = new sqlite3.Database('./users.db');
 
 // Créer la table des utilisateurs
-pool.query(`
+db.run(`
     CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        email VARCHAR(255) UNIQUE,
-        password VARCHAR(255),
-        "firstName" VARCHAR(255),
-        "lastName" VARCHAR(255),
-        phone VARCHAR(255),
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT UNIQUE,
+        password TEXT,
+        firstName TEXT,
+        lastName TEXT,
+        phone TEXT,
         address TEXT,
-        "createdAt" TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
     )
 `, (err) => {
     if (err) console.error('Erreur création table:', err);
     else console.log('Table utilisateurs créée/connectée');
+});
+
+// Créer la table des commandes
+db.run(`
+    CREATE TABLE IF NOT EXISTS orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        userId INTEGER,
+        orderData TEXT,
+        totalPrice REAL,
+        totalItems INTEGER,
+        status TEXT DEFAULT 'pending',
+        createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (userId) REFERENCES users (id)
+    )
+`, (err) => {
+    if (err) console.error('Erreur création table orders:', err);
+    else console.log('Table commandes créée/connectée');
 });
 
 // Middleware
@@ -39,7 +95,7 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, 'client/build')));
 
 // Configuration email
-const transporter = nodemailer.createTransporter({
+const transporter = nodemailer.createTransport({
     service: 'gmail',
     auth: {
         user: process.env.EMAIL_USER || 'pushagrifarm@gmail.com',
@@ -51,37 +107,53 @@ const transporter = nodemailer.createTransporter({
 app.post('/api/register', async (req, res) => {
     try {
         const { email, password, firstName, lastName, phone, address } = req.body;
-        
+
         // Vérifier si l'utilisateur existe déjà
-        const existingUser = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
-        
-        if (existingUser.rows.length > 0) {
-            return res.status(400).json({ success: false, message: 'Cet email est déjà utilisé' });
-        }
-        
-        // Hasher le mot de passe
-        const hashedPassword = await bcrypt.hash(password, 10);
-        
-        // Insérer le nouvel utilisateur
-        const result = await pool.query(
-            'INSERT INTO users (email, password, "firstName", "lastName", phone, address) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
-            [email, hashedPassword, firstName, lastName, phone, address]
-        );
-        
-        const userId = result.rows[0].id;
-        
-        // Générer un token JWT
-        const token = jwt.sign(
-            { userId, email },
-            process.env.JWT_SECRET || 'your-secret-key',
-            { expiresIn: '7d' }
-        );
-        
-        res.json({
-            success: true,
-            message: 'Compte créé avec succès',
-            token,
-            user: { id: userId, email, firstName, lastName }
+        db.get('SELECT * FROM users WHERE email = ?', [email], async (err, existingUser) => {
+            if (err) {
+                console.error('Erreur vérification utilisateur:', err);
+                return res.status(500).json({ success: false, message: 'Erreur serveur' });
+            }
+
+            if (existingUser) {
+                return res.status(400).json({ success: false, message: 'Cet email est déjà utilisé' });
+            }
+
+            try {
+                // Hasher le mot de passe
+                const hashedPassword = await bcrypt.hash(password, 10);
+
+                // Insérer le nouvel utilisateur
+                db.run(
+                    'INSERT INTO users (email, password, firstName, lastName, phone, address) VALUES (?, ?, ?, ?, ?, ?)',
+                    [email, hashedPassword, firstName, lastName, phone, address],
+                    function (err) {
+                        if (err) {
+                            console.error('Erreur insertion utilisateur:', err);
+                            return res.status(500).json({ success: false, message: 'Erreur serveur' });
+                        }
+
+                        const userId = this.lastID;
+
+                        // Générer un token JWT
+                        const token = jwt.sign(
+                            { userId, email },
+                            process.env.JWT_SECRET || 'your-secret-key',
+                            { expiresIn: '7d' }
+                        );
+
+                        res.json({
+                            success: true,
+                            message: 'Compte créé avec succès',
+                            token,
+                            user: { id: userId, email, firstName, lastName }
+                        });
+                    }
+                );
+            } catch (error) {
+                console.error('Erreur inscription:', error);
+                res.status(500).json({ success: false, message: 'Erreur serveur' });
+            }
         });
     } catch (error) {
         console.error('Erreur inscription:', error);
@@ -92,37 +164,45 @@ app.post('/api/register', async (req, res) => {
 app.post('/api/login', async (req, res) => {
     try {
         const { email, password } = req.body;
-        
-        const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
-        
-        if (result.rows.length === 0) {
-            return res.status(400).json({ success: false, message: 'Email ou mot de passe incorrect' });
-        }
-        
-        const user = result.rows[0];
-        
-        // Vérifier le mot de passe
-        const isValidPassword = await bcrypt.compare(password, user.password);
-        if (!isValidPassword) {
-            return res.status(400).json({ success: false, message: 'Email ou mot de passe incorrect' });
-        }
-        
-        // Générer un token JWT
-        const token = jwt.sign(
-            { userId: user.id, email: user.email },
-            process.env.JWT_SECRET || 'your-secret-key',
-            { expiresIn: '7d' }
-        );
-        
-        res.json({
-            success: true,
-            message: 'Connexion réussie',
-            token,
-            user: { 
-                id: user.id, 
-                email: user.email, 
-                firstName: user.firstName, 
-                lastName: user.lastName 
+
+        db.get('SELECT * FROM users WHERE email = ?', [email], async (err, user) => {
+            if (err) {
+                console.error('Erreur connexion:', err);
+                return res.status(500).json({ success: false, message: 'Erreur serveur' });
+            }
+
+            if (!user) {
+                return res.status(400).json({ success: false, message: 'Email ou mot de passe incorrect' });
+            }
+
+            try {
+                // Vérifier le mot de passe
+                const isValidPassword = await bcrypt.compare(password, user.password);
+                if (!isValidPassword) {
+                    return res.status(400).json({ success: false, message: 'Email ou mot de passe incorrect' });
+                }
+
+                // Générer un token JWT
+                const token = jwt.sign(
+                    { userId: user.id, email: user.email },
+                    process.env.JWT_SECRET || 'your-secret-key',
+                    { expiresIn: '7d' }
+                );
+
+                res.json({
+                    success: true,
+                    message: 'Connexion réussie',
+                    token,
+                    user: {
+                        id: user.id,
+                        email: user.email,
+                        firstName: user.firstName,
+                        lastName: user.lastName
+                    }
+                });
+            } catch (error) {
+                console.error('Erreur connexion:', error);
+                res.status(500).json({ success: false, message: 'Erreur serveur' });
             }
         });
     } catch (error) {
@@ -135,21 +215,81 @@ app.post('/api/login', async (req, res) => {
 app.put('/api/profile', async (req, res) => {
     try {
         const { userId, firstName, lastName, phone, address, city } = req.body;
-        
-        await pool.query(
-            'UPDATE users SET "firstName" = $1, "lastName" = $2, phone = $3, address = $4 WHERE id = $5',
-            [firstName, lastName, phone, address, userId]
+
+        db.run(
+            'UPDATE users SET firstName = ?, lastName = ?, phone = ?, address = ? WHERE id = ?',
+            [firstName, lastName, phone, address, userId],
+            function (err) {
+                if (err) {
+                    console.error('Erreur mise à jour profil:', err);
+                    return res.status(500).json({ success: false, message: 'Erreur serveur' });
+                }
+
+                res.json({
+                    success: true,
+                    message: 'Profil mis à jour avec succès'
+                });
+            }
         );
-        
-        res.json({
-            success: true,
-            message: 'Profil mis à jour avec succès'
-        });
     } catch (error) {
         console.error('Erreur mise à jour profil:', error);
         res.status(500).json({ success: false, message: 'Erreur serveur' });
     }
 });
+
+// Route pour sauvegarder une commande
+app.post('/api/orders', async (req, res) => {
+    try {
+        const { userId, orderData, totalPrice, totalItems } = req.body;
+
+        db.run(
+            'INSERT INTO orders (userId, orderData, totalPrice, totalItems) VALUES (?, ?, ?, ?)',
+            [userId, JSON.stringify(orderData), totalPrice, totalItems],
+            function (err) {
+                if (err) {
+                    console.error('Erreur sauvegarde commande:', err);
+                    return res.status(500).json({ success: false, message: 'Erreur serveur' });
+                }
+
+                res.json({
+                    success: true,
+                    message: 'Commande sauvegardée avec succès',
+                    orderId: this.lastID
+                });
+            }
+        );
+    } catch (error) {
+        console.error('Erreur sauvegarde commande:', error);
+        res.status(500).json({ success: false, message: 'Erreur serveur' });
+    }
+});
+
+// Route pour récupérer l'historique des commandes d'un utilisateur
+app.get('/api/orders/:userId', async (req, res) => {
+    try {
+        const { userId } = req.params;
+
+        db.all(
+            'SELECT * FROM orders WHERE userId = ? ORDER BY createdAt DESC',
+            [userId],
+            (err, orders) => {
+                if (err) {
+                    console.error('Erreur récupération commandes:', err);
+                    return res.status(500).json({ success: false, message: 'Erreur serveur' });
+                }
+
+                res.json({
+                    success: true,
+                    orders: orders
+                });
+            }
+        );
+    } catch (error) {
+        console.error('Erreur récupération commandes:', error);
+        res.status(500).json({ success: false, message: 'Erreur serveur' });
+    }
+});
+
 
 // Routes API
 app.post('/api/contact', async (req, res) => {
@@ -188,6 +328,22 @@ app.get('*', (req, res) => {
     res.sendFile(path.join(__dirname, 'client/build', 'index.html'));
 });
 
-app.listen(PORT, () => {
-    console.log(`Serveur démarré sur le port ${PORT}`);
-});
+// Démarrage du serveur avec recherche automatique de port disponible
+async function startServer() {
+    try {
+        const availablePort = await findAvailablePort(PORT);
+
+        app.listen(availablePort, () => {
+            console.log(`🚀 Serveur démarré avec succès sur le port ${availablePort}`);
+            if (availablePort !== PORT) {
+                console.log(`⚠️  Le port ${PORT} était occupé, utilisation du port ${availablePort} à la place`);
+            }
+        });
+    } catch (error) {
+        console.error('❌ Erreur lors du démarrage du serveur:', error.message);
+        process.exit(1);
+    }
+}
+
+// Démarrer le serveur
+startServer();
